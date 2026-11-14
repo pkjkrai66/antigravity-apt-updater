@@ -1,0 +1,245 @@
+cat << 'EOF' > sbin/antigravity-apt-hook
+#!/usr/bin/env bash
+set -u
+
+STATE_DIR="/var/lib/antigravity-updater"
+SYS_APP_DIR="/usr/share/applications"
+SYS_ICON_DIR="/usr/share/icons/hicolor/256x256/apps"
+mkdir -p "$STATE_DIR" "$SYS_APP_DIR" "$SYS_ICON_DIR"
+
+# Zero-dependency ASAR root package.json version reader (Antigravity App)
+get_app_asar_version() {
+    local asar="$1"
+    [[ -f "$asar" ]] || return 1
+
+    local _ header_size _ json_size offset size
+    read -r _ header_size _ json_size < <(od -An -t u4 -N 16 "$asar" 2>/dev/null) || return 1
+    [[ -n "${header_size:-}" && -n "${json_size:-}" ]] || return 1
+
+    read -r offset size < <(
+        dd if="$asar" bs=1 skip=16 count="$json_size" status=none 2>/dev/null \
+        | grep -oE '"package\.json"[[:space:]]*:[[:space:]]*\{[^}]+\}' \
+        | tail -n 1 \
+        | sed -E 's/.*"size"[[:space:]]*:[[:space:]]*([0-9]+).*"offset"[[:space:]]*:[[:space:]]*"([0-9]+)".*/\2 \1/; s/.*"offset"[[:space:]]*:[[:space:]]*"([0-9]+)".*"size"[[:space:]]*:[[:space:]]*([0-9]+).*/\1 \2/'
+    )
+    [[ -n "${offset:-}" && -n "${size:-}" ]] || return 1
+
+    dd if="$asar" bs=1 skip=$((8 + header_size + offset)) count="$size" status=none 2>/dev/null \
+        | grep -oE '"version"[[:space:]]*:[[:space:]]*"[^"]+"' \
+        | awk -F'"' 'NR==1 {print $4; exit}'
+}
+
+# Zero-dependency ASAR PNG icon extractor (Antigravity App)
+extract_app_icon() {
+    local asar="$1"
+    local out_png="$2"
+    [[ -f "$asar" ]] || return 1
+
+    local _ header_size _ json_size size offset
+    read -r _ header_size _ json_size < <(od -An -t u4 -N 16 "$asar" 2>/dev/null) || return 1
+    [[ -n "${header_size:-}" && -n "${json_size:-}" ]] || return 1
+
+    read -r size offset < <(
+        dd if="$asar" bs=1 skip=16 count="$json_size" status=none 2>/dev/null \
+        | grep -oE '"[^"]+\.png"[[:space:]]*:[[:space:]]*\{[^}]+\}' \
+        | sed -E 's/"([^"]+\.png)"[[:space:]]*:[[:space:]]*\{[^}]*"size"[[:space:]]*:[[:space:]]*([0-9]+)[^}]*"offset"[[:space:]]*:[[:space:]]*"([0-9]+)".*/\2 \3/; s/"([^"]+\.png)"[[:space:]]*:[[:space:]]*\{[^}]*"offset"[[:space:]]*:[[:space:]]*"([0-9]+)"[^}]*"size"[[:space:]]*:[[:space:]]*([0-9]+).*/\3 \2/' \
+        | sort -nr \
+        | awk 'NR==1 {print; exit}'
+    )
+    [[ -n "${size:-}" && -n "${offset:-}" ]] || return 1
+
+    dd if="$asar" bs=1 skip=$((8 + header_size + offset)) count="$size" of="$out_png" status=none 2>/dev/null
+    chmod 644 "$out_png"
+}
+
+# Zero-dependency product.json ideVersion reader (Antigravity IDE)
+get_ide_product_version() {
+    local prod="$1"
+    [[ -f "$prod" ]] || return 1
+
+    grep -oE '"ideVersion"[[:space:]]*:[[:space:]]*"[^"]+"' "$prod" 2>/dev/null \
+        | awk -F'"' 'NR==1 {print $4; exit}'
+}
+
+# Ensure system-wide .desktop files and icons exist
+ensure_desktop_entries() {
+    local refreshed=0
+
+    if [[ -d "/opt/antigravity" ]]; then
+        local app_icon="$SYS_ICON_DIR/antigravity.png"
+        if [[ ! -s "$app_icon" ]]; then
+            if extract_app_icon "/opt/antigravity/resources/app.asar" "$app_icon"; then
+                refreshed=1
+            fi
+        fi
+
+        local app_desktop="$SYS_APP_DIR/antigravity.desktop"
+        if [[ ! -f "$app_desktop" ]]; then
+            cat > "$app_desktop" << 'DESKTOP'
+[Desktop Entry]
+Name=Antigravity
+Comment=Google Antigravity Desktop Application
+Exec=/usr/local/bin/antigravity %U
+Icon=/usr/share/icons/hicolor/256x256/apps/antigravity.png
+Terminal=false
+Type=Application
+Categories=Development;Utility;
+StartupWMClass=Antigravity
+DESKTOP
+            chmod 644 "$app_desktop"
+            refreshed=1
+        fi
+    fi
+
+    if [[ -d "/opt/antigravity-ide" ]]; then
+        local ide_desktop="$SYS_APP_DIR/antigravity-ide.desktop"
+        if [[ ! -f "$ide_desktop" ]]; then
+            cat > "$ide_desktop" << 'DESKTOP'
+[Desktop Entry]
+Name=Antigravity IDE
+Comment=Code Editing. Redefined.
+GenericName=Text Editor
+Exec=/usr/local/bin/antigravity-ide %F
+Icon=/opt/antigravity-ide/resources/app/resources/linux/code.png
+Type=Application
+StartupNotify=false
+StartupWMClass=Antigravity IDE
+Categories=TextEditor;Development;IDE;
+MimeType=application/x-antigravity-ide-workspace;
+Actions=new-empty-window;
+Keywords=vscode;antigravity;ide;
+
+[Desktop Action new-empty-window]
+Name=New Empty Window
+Exec=/usr/local/bin/antigravity-ide --new-window %F
+Icon=/opt/antigravity-ide/resources/app/resources/linux/code.png
+DESKTOP
+            chmod 644 "$ide_desktop"
+            refreshed=1
+        fi
+    fi
+
+    if [[ "$refreshed" -eq 1 ]]; then
+        gtk-update-icon-cache -f -t /usr/share/icons/hicolor 2>/dev/null || true
+        update-desktop-database "$SYS_APP_DIR" 2>/dev/null || true
+        echo "[antigravity-hook] System desktop launchers and icons verified."
+    fi
+}
+
+# Fetch raw HTML from the download page with retries and timeout
+PAGE=$(curl -fsSL --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 1 "https://antigravity.google/download" 2>/dev/null)
+if [[ -z "$PAGE" ]]; then
+    echo "[antigravity-hook] Offline or download page unreachable; skipping."
+    exit 0
+fi
+
+APP_URL=$(printf '%s\n' "$PAGE" | grep -oE 'https://storage\.googleapis\.com/[^"'\'' <>]+/linux-x64/Antigravity\.tar\.gz' | awk 'NR==1 {print; exit}')
+IDE_URL=$(printf '%s\n' "$PAGE" | grep -oE 'https://edgedl\.me\.gvt1\.com/[^"'\'' <>]+/linux-x64/Antigravity(%20| )IDE\.tar\.gz' | awk 'NR==1 {print; exit}')
+
+swap_install() {
+    local label="$1"
+    local install_dir="$2"
+    local bin_name="$3"
+    local url="$4"
+    local target_id="$5"
+
+    if [[ -d "$install_dir" ]] && pgrep -f "$install_dir/$bin_name" >/dev/null 2>&1; then
+        echo "[antigravity-hook] Update $target_id available for $label, but app is running. Skipping."
+        return 1
+    fi
+
+    if [[ -d "$install_dir" ]]; then
+        echo "[antigravity-hook] Updating $label to $target_id..."
+    else
+        echo "[antigravity-hook] Installing $label $target_id afresh..."
+    fi
+
+    local tmp_dir
+    tmp_dir="$(mktemp -d)"
+
+    if ! curl -fsL --connect-timeout 15 --retry 2 "$url" -o "$tmp_dir/archive.tar.gz"; then
+        echo "[antigravity-hook] Download failed for $label; skipping."
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+
+    mkdir -p "$tmp_dir/extracted"
+    if ! tar -xzf "$tmp_dir/archive.tar.gz" -C "$tmp_dir/extracted"; then
+        echo "[antigravity-hook] Archive extraction failed for $label; skipping."
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+
+    local top_entries=("$tmp_dir/extracted"/*)
+    local stage_dir="$tmp_dir/extracted"
+    if [[ ${#top_entries[@]} -eq 1 && -d "${top_entries[0]}" ]]; then
+        stage_dir="${top_entries[0]}"
+    fi
+
+    if [[ ! -f "$stage_dir/chrome-sandbox" ]]; then
+        echo "[antigravity-hook] Unexpected archive structure for $label; aborting."
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+
+    rm -rf "${install_dir}.bak"
+    [[ -d "$install_dir" ]] && mv "$install_dir" "${install_dir}.bak"
+    mkdir -p "$install_dir"
+    cp -a "$stage_dir"/. "$install_dir"/
+
+    chown -R root:root "$install_dir"
+    chmod 4755 "$install_dir/chrome-sandbox"
+    ln -sfn "$install_dir/$bin_name" "/usr/local/bin/$bin_name"
+    rm -rf "${install_dir}.bak" "$tmp_dir"
+    return 0
+}
+
+# --- 1. Antigravity App (fresh install OR live ASAR version + build ID update) ---
+if [[ -z "$APP_URL" ]]; then
+    echo "[antigravity-hook] Could not resolve URL for Antigravity App; skipping."
+else
+    REMOTE_APP_BUILD=$(printf '%s\n' "$APP_URL" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+-[0-9]+' | awk 'NR==1 {print; exit}')
+    : "${REMOTE_APP_BUILD:=$APP_URL}"
+    REMOTE_APP_VER="${REMOTE_APP_BUILD%%-*}"
+    LOCAL_APP_VER=$(get_app_asar_version "/opt/antigravity/resources/app.asar" || echo "none")
+    LOCAL_APP_BUILD=$(cat "$STATE_DIR/antigravity.build" 2>/dev/null || echo "")
+
+    if [[ -d "/opt/antigravity" ]] && [[ "$LOCAL_APP_VER" == "$REMOTE_APP_VER" ]] && [[ -z "$LOCAL_APP_BUILD" || "$LOCAL_APP_BUILD" == "$REMOTE_APP_BUILD" ]]; then
+        echo "$REMOTE_APP_BUILD" > "$STATE_DIR/antigravity.build"
+        echo "[antigravity-hook] Antigravity App ($LOCAL_APP_VER | build $REMOTE_APP_BUILD) is up to date."
+    else
+        if swap_install "Antigravity App" "/opt/antigravity" "antigravity" "$APP_URL" "$REMOTE_APP_VER ($REMOTE_APP_BUILD)"; then
+            NEW_APP_VER=$(get_app_asar_version "/opt/antigravity/resources/app.asar" || echo "$REMOTE_APP_VER")
+            echo "$REMOTE_APP_BUILD" > "$STATE_DIR/antigravity.build"
+            extract_app_icon "/opt/antigravity/resources/app.asar" "$SYS_ICON_DIR/antigravity.png" || true
+            echo "[antigravity-hook] Antigravity App ready: $LOCAL_APP_VER -> $NEW_APP_VER ($REMOTE_APP_BUILD)."
+        fi
+    fi
+fi
+
+# --- 2. Antigravity IDE (fresh install OR live product.json ideVersion + build ID update) ---
+if [[ -z "$IDE_URL" ]]; then
+    echo "[antigravity-hook] Could not resolve URL for Antigravity IDE; skipping."
+else
+    REMOTE_IDE_BUILD=$(printf '%s\n' "$IDE_URL" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+-[0-9]+' | awk 'NR==1 {print; exit}')
+    : "${REMOTE_IDE_BUILD:=$IDE_URL}"
+    REMOTE_IDE_VER="${REMOTE_IDE_BUILD%%-*}"
+    LOCAL_IDE_VER=$(get_ide_product_version "/opt/antigravity-ide/resources/app/product.json" || echo "none")
+    LOCAL_IDE_BUILD=$(cat "$STATE_DIR/antigravity-ide.build" 2>/dev/null || echo "")
+
+    if [[ -d "/opt/antigravity-ide" ]] && [[ "$LOCAL_IDE_VER" == "$REMOTE_IDE_VER" ]] && [[ -z "$LOCAL_IDE_BUILD" || "$LOCAL_IDE_BUILD" == "$REMOTE_IDE_BUILD" ]]; then
+        echo "$REMOTE_IDE_BUILD" > "$STATE_DIR/antigravity-ide.build"
+        echo "[antigravity-hook] Antigravity IDE ($LOCAL_IDE_VER | build $REMOTE_IDE_BUILD) is up to date."
+    else
+        if swap_install "Antigravity IDE" "/opt/antigravity-ide" "antigravity-ide" "$IDE_URL" "$REMOTE_IDE_VER ($REMOTE_IDE_BUILD)"; then
+            NEW_IDE_VER=$(get_ide_product_version "/opt/antigravity-ide/resources/app/product.json" || echo "$REMOTE_IDE_VER")
+            echo "$REMOTE_IDE_BUILD" > "$STATE_DIR/antigravity-ide.build"
+            echo "[antigravity-hook] Antigravity IDE ready: $LOCAL_IDE_VER -> $NEW_IDE_VER ($REMOTE_IDE_BUILD)."
+        fi
+    fi
+fi
+
+# --- 3. Provision missing system-wide .desktop files and icons ---
+ensure_desktop_entries
+EOF
+chmod +x sbin/antigravity-apt-hook

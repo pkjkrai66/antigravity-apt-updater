@@ -1,0 +1,35 @@
+cat << 'EOF' > bin/agy-ver
+#!/usr/bin/env bash
+set -u
+
+APP_ASAR="/opt/antigravity/resources/app.asar"
+IDE_PROD="/opt/antigravity-ide/resources/app/product.json"
+STATE_DIR="/var/lib/antigravity-updater"
+
+if [[ -f "$APP_ASAR" ]]; then
+    read -r _ hs _ json_sz < <(od -An -t u4 -N 16 "$APP_ASAR")
+    read -r off sz < <(
+        dd if="$APP_ASAR" bs=1 skip=16 count="$json_sz" status=none \
+        | grep -oE '"package\.json"[[:space:]]*:[[:space:]]*\{[^}]+\}' \
+        | tail -n 1 \
+        | sed -E 's/.*"size"[[:space:]]*:[[:space:]]*([0-9]+).*"offset"[[:space:]]*:[[:space:]]*"([0-9]+)".*/\2 \1/; s/.*"offset"[[:space:]]*:[[:space:]]*"([0-9]+)".*"size"[[:space:]]*:[[:space:]]*([0-9]+).*/\1 \2/'
+    )
+    app_ver=$(dd if="$APP_ASAR" bs=1 skip=$((8 + hs + off)) count="$sz" status=none \
+        | grep -oE '"version"[[:space:]]*:[[:space:]]*"[^"]+"' \
+        | awk -F'"' 'NR==1 {print $4; exit}')
+    app_build=$(cat "$STATE_DIR/antigravity.build" 2>/dev/null || echo "untracked")
+    echo "Antigravity App : ${app_ver:-unknown} (build: $app_build)"
+else
+    echo "Antigravity App : not installed"
+fi
+
+if [[ -f "$IDE_PROD" ]]; then
+    ide_ver=$(grep -oE '"ideVersion"[[:space:]]*:[[:space:]]*"[^"]+"' "$IDE_PROD" \
+        | awk -F'"' 'NR==1 {print $4; exit}')
+    ide_build=$(cat "$STATE_DIR/antigravity-ide.build" 2>/dev/null || echo "untracked")
+    echo "Antigravity IDE : ${ide_ver:-unknown} (build: $ide_build)"
+else
+    echo "Antigravity IDE : not installed"
+fi
+EOF
+chmod +x bin/agy-ver
