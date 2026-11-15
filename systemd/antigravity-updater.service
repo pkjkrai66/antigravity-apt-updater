@@ -1,0 +1,11 @@
+[Unit]
+Description=Google Antigravity and Antigravity IDE Auto-Updater
+Documentation=https://github.com/pankaj-rai/antigravity-apt-updater
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/antigravity-apt-hook
+StandardOutput=journal
+StandardError=journal

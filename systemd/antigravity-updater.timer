@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily update check for Google Antigravity and Antigravity IDE
+Documentation=https://github.com/pankaj-rai/antigravity-apt-updater
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=30m
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,35 +1,132 @@
-cat << 'EOF' > bin/agy-ver
 #!/usr/bin/env bash
-set -u
+set -euo pipefail
 
 APP_ASAR="/opt/antigravity/resources/app.asar"
 IDE_PROD="/opt/antigravity-ide/resources/app/product.json"
 STATE_DIR="/var/lib/antigravity-updater"
 
-if [[ -f "$APP_ASAR" ]]; then
-    read -r _ hs _ json_sz < <(od -An -t u4 -N 16 "$APP_ASAR")
-    read -r off sz < <(
-        dd if="$APP_ASAR" bs=1 skip=16 count="$json_sz" status=none \
+OUTPUT_JSON=0
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --json)
+            OUTPUT_JSON=1
+            shift
+            ;;
+        -h|--help)
+            echo "Usage: agy-ver [OPTIONS]"
+            echo ""
+            echo "Options:"
+            echo "  --json      Output installed versions in JSON format"
+            echo "  -h, --help  Show this help message"
+            echo ""
+            echo "Exit codes:"
+            echo "  0  Both Antigravity App and IDE are installed"
+            echo "  1  Only one application is installed"
+            echo "  2  Neither application is installed"
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $1" >&2
+            echo "Run 'agy-ver --help' for usage." >&2
+            exit 1
+            ;;
+    esac
+done
+
+get_app_version() {
+    local asar="$1"
+    [[ -f "$asar" ]] || return 1
+    local header_line hs json_sz
+    header_line="$(od -An -t u4 -N 16 "$asar" 2>/dev/null || true)"
+    [[ -n "$header_line" ]] || return 1
+    read -r _ hs _ json_sz <<< "$header_line"
+    [[ -n "${hs:-}" && -n "${json_sz:-}" && "$json_sz" -gt 0 ]] || return 1
+
+    local pkg_info off sz
+    pkg_info="$(
+        dd if="$asar" bs=1 skip=16 count="$json_sz" status=none 2>/dev/null \
         | grep -oE '"package\.json"[[:space:]]*:[[:space:]]*\{[^}]+\}' \
         | tail -n 1 \
-        | sed -E 's/.*"size"[[:space:]]*:[[:space:]]*([0-9]+).*"offset"[[:space:]]*:[[:space:]]*"([0-9]+)".*/\2 \1/; s/.*"offset"[[:space:]]*:[[:space:]]*"([0-9]+)".*"size"[[:space:]]*:[[:space:]]*([0-9]+).*/\1 \2/'
-    )
-    app_ver=$(dd if="$APP_ASAR" bs=1 skip=$((8 + hs + off)) count="$sz" status=none \
+        | sed -E 's/.*"size"[[:space:]]*:[[:space:]]*([0-9]+).*"offset"[[:space:]]*:[[:space:]]*"([0-9]+)".*/\2 \1/; s/.*"offset"[[:space:]]*:[[:space:]]*"([0-9]+)".*"size"[[:space:]]*:[[:space:]]*([0-9]+).*/\1 \2/' \
+        || true
+    )"
+    [[ -n "$pkg_info" ]] || return 1
+    read -r off sz <<< "$pkg_info"
+    [[ -n "${off:-}" && -n "${sz:-}" ]] || return 1
+
+    dd if="$asar" bs=1 skip=$((8 + hs + off)) count="$sz" status=none 2>/dev/null \
         | grep -oE '"version"[[:space:]]*:[[:space:]]*"[^"]+"' \
-        | awk -F'"' 'NR==1 {print $4; exit}')
-    app_build=$(cat "$STATE_DIR/antigravity.build" 2>/dev/null || echo "untracked")
-    echo "Antigravity App : ${app_ver:-unknown} (build: $app_build)"
-else
-    echo "Antigravity App : not installed"
+        | awk -F'"' 'NR==1 {print $4; exit}' || true
+}
+
+get_ide_version() {
+    local prod="$1"
+    [[ -f "$prod" ]] || return 1
+    grep -oE '"ideVersion"[[:space:]]*:[[:space:]]*"[^"]+"' "$prod" 2>/dev/null \
+        | awk -F'"' 'NR==1 {print $4; exit}' || true
+}
+
+app_installed=0
+ide_installed=0
+app_ver="not installed"
+app_build="none"
+ide_ver="not installed"
+ide_build="none"
+
+if [[ -f "$APP_ASAR" ]]; then
+    app_installed=1
+    app_ver="$(get_app_version "$APP_ASAR" || echo "unknown")"
+    : "${app_ver:=unknown}"
+    app_build="$(cat "$STATE_DIR/antigravity.build" 2>/dev/null || echo "untracked")"
 fi
 
 if [[ -f "$IDE_PROD" ]]; then
-    ide_ver=$(grep -oE '"ideVersion"[[:space:]]*:[[:space:]]*"[^"]+"' "$IDE_PROD" \
-        | awk -F'"' 'NR==1 {print $4; exit}')
-    ide_build=$(cat "$STATE_DIR/antigravity-ide.build" 2>/dev/null || echo "untracked")
-    echo "Antigravity IDE : ${ide_ver:-unknown} (build: $ide_build)"
-else
-    echo "Antigravity IDE : not installed"
+    ide_installed=1
+    ide_ver="$(get_ide_version "$IDE_PROD" || echo "unknown")"
+    : "${ide_ver:=unknown}"
+    ide_build="$(cat "$STATE_DIR/antigravity-ide.build" 2>/dev/null || echo "untracked")"
 fi
-EOF
-chmod +x bin/agy-ver
+
+if [[ "$OUTPUT_JSON" -eq 1 ]]; then
+    app_inst_bool="false"
+    [[ "$app_installed" -eq 1 ]] && app_inst_bool="true"
+    ide_inst_bool="false"
+    [[ "$ide_installed" -eq 1 ]] && ide_inst_bool="true"
+
+    cat << JSON
+{
+  "antigravity_app": {
+    "installed": ${app_inst_bool},
+    "version": "${app_ver}",
+    "build": "${app_build}"
+  },
+  "antigravity_ide": {
+    "installed": ${ide_inst_bool},
+    "version": "${ide_ver}",
+    "build": "${ide_build}"
+  }
+}
+JSON
+else
+    if [[ "$app_installed" -eq 1 ]]; then
+        echo "Antigravity App : ${app_ver} (build: ${app_build})"
+    else
+        echo "Antigravity App : not installed"
+    fi
+
+    if [[ "$ide_installed" -eq 1 ]]; then
+        echo "Antigravity IDE : ${ide_ver} (build: ${ide_build})"
+    else
+        echo "Antigravity IDE : not installed"
+    fi
+fi
+
+total_installed=$((app_installed + ide_installed))
+if [[ "$total_installed" -eq 2 ]]; then
+    exit 0
+elif [[ "$total_installed" -eq 1 ]]; then
+    exit 1
+else
+    exit 2
+fi

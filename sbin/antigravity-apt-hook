@@ -1,70 +1,245 @@
-cat << 'EOF' > sbin/antigravity-apt-hook
 #!/usr/bin/env bash
-set -u
+set -euo pipefail
 
 STATE_DIR="/var/lib/antigravity-updater"
 SYS_APP_DIR="/usr/share/applications"
 SYS_ICON_DIR="/usr/share/icons/hicolor/256x256/apps"
-mkdir -p "$STATE_DIR" "$SYS_APP_DIR" "$SYS_ICON_DIR"
+LOG_FILE="/var/log/antigravity-updater.log"
 
-# Zero-dependency ASAR root package.json version reader (Antigravity App)
+LOCK_FILE="/run/lock/antigravity-updater.lock"
+[[ -d "/run/lock" ]] || LOCK_FILE="/var/lock/antigravity-updater.lock"
+
+FORCE_UPDATE=0
+DRY_RUN=0
+CLEANUP_DIRS=()
+
+cleanup() {
+    for d in "${CLEANUP_DIRS[@]}"; do
+        if [[ -d "$d" ]]; then
+            rm -rf "$d" 2>/dev/null || true
+        fi
+    done
+}
+trap cleanup EXIT INT TERM
+
+log() {
+    local ts
+    ts="$(date '+%Y-%m-%d %H:%M:%S')"
+    echo "[antigravity-hook] $*"
+    if [[ -w "/var/log" || -w "$LOG_FILE" ]]; then
+        echo "[$ts] [antigravity-hook] $*" >> "$LOG_FILE" 2>/dev/null || true
+    fi
+}
+
+show_help() {
+    cat << 'HELP'
+Usage: sudo antigravity-apt-hook [OPTIONS]
+
+APT/system updater for Google Antigravity App and Antigravity IDE.
+
+Options:
+  --force     Force download and installation even if versions match
+  --dry-run   Check remote versions without downloading or modifying files
+  --check     Alias for --dry-run
+  -h, --help  Show this help message
+HELP
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --force)
+            FORCE_UPDATE=1
+            shift
+            ;;
+        --dry-run|--check)
+            DRY_RUN=1
+            shift
+            ;;
+        -h|--help)
+            show_help
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $1" >&2
+            show_help >&2
+            exit 1
+            ;;
+    esac
+done
+
+# --- 1. Architecture Check ---
+ARCH="$(uname -m)"
+if [[ "$ARCH" != "x86_64" ]]; then
+    log "Architecture '$ARCH' is not supported (Google distributes x86_64 Linux builds only); skipping."
+    exit 0
+fi
+
+# --- 2. Environment & Lock Setup ---
+if [[ "$DRY_RUN" -eq 0 ]]; then
+    mkdir -p "$STATE_DIR" "$SYS_APP_DIR" "$SYS_ICON_DIR" "$(dirname "$LOCK_FILE")"
+    exec 9>"$LOCK_FILE"
+    if ! flock -n 9; then
+        log "Another instance of antigravity-apt-hook is already running; skipping."
+        exit 0
+    fi
+fi
+
+# Inherit APT proxy configurations if not present in environment
+if [[ -z "${http_proxy:-}" ]] && command -v apt-config >/dev/null 2>&1; then
+    apt_http_proxy="$(apt-config dump 2>/dev/null | grep -i 'Acquire::http::Proxy ' | head -n1 | awk '{print $2}' | tr -d '";' || true)"
+    if [[ -n "$apt_http_proxy" && "$apt_http_proxy" != "DIRECT" ]]; then
+        export http_proxy="$apt_http_proxy"
+    fi
+fi
+if [[ -z "${https_proxy:-}" ]] && command -v apt-config >/dev/null 2>&1; then
+    apt_https_proxy="$(apt-config dump 2>/dev/null | grep -i 'Acquire::https::Proxy ' | head -n1 | awk '{print $2}' | tr -d '";' || true)"
+    if [[ -n "$apt_https_proxy" && "$apt_https_proxy" != "DIRECT" ]]; then
+        export https_proxy="$apt_https_proxy"
+    fi
+fi
+
+# --- Helper: Accurate Process Check (prevents TOCTOU false positives) ---
+is_app_running() {
+    local target_bin="$1"
+    [[ -e "$target_bin" ]] || return 1
+    local canonical_target
+    canonical_target="$(readlink -f "$target_bin" 2>/dev/null || echo "$target_bin")"
+
+    # 1. Direct inspection of /proc/*/exe
+    local exe_link resolved
+    for exe_link in /proc/[0-9]*/exe; do
+        if [[ -L "$exe_link" ]]; then
+            resolved="$(readlink -f "$exe_link" 2>/dev/null || true)"
+            if [[ "$resolved" == "$canonical_target" ]]; then
+                return 0
+            fi
+        fi
+    done
+
+    # 2. Check exact binary basename against active PIDs
+    local bin_base
+    bin_base="$(basename "$target_bin")"
+    if pgrep -x "$bin_base" >/dev/null 2>&1; then
+        local pid pid_exe
+        for pid in $(pgrep -x "$bin_base" 2>/dev/null || true); do
+            pid_exe="$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)"
+            if [[ "$pid_exe" == "$canonical_target" ]]; then
+                return 0
+            fi
+        done
+    fi
+
+    return 1
+}
+
+# --- Helper: Semantic Version Comparison ---
+# 0: v1 == v2, 1: v1 > v2, 2: v1 < v2
+version_compare() {
+    local v1="$1" v2="$2"
+    [[ "$v1" == "$v2" ]] && return 0
+    local oldest
+    oldest="$(printf '%s\n%s\n' "$v1" "$v2" | sort -V | head -n 1)"
+    if [[ "$oldest" == "$v1" ]]; then
+        return 2  # v1 < v2
+    else
+        return 1  # v1 > v2
+    fi
+}
+
+# --- Helper: Disk Space Check ---
+check_disk_space() {
+    local target_path="$1"
+    local required_mb="${2:-500}"
+    local required_kb=$((required_mb * 1024))
+
+    local check_dir="$target_path"
+    while [[ ! -d "$check_dir" && "$check_dir" != "/" ]]; do
+        check_dir="$(dirname "$check_dir")"
+    done
+
+    local avail_kb
+    avail_kb="$(df -k "$check_dir" 2>/dev/null | awk 'NR==2 {print $4}' || echo "0")"
+    if [[ -n "$avail_kb" && "$avail_kb" =~ ^[0-9]+$ ]]; then
+        if (( avail_kb < required_kb )); then
+            log "Insufficient free space on $check_dir (available: $((avail_kb / 1024))MB, required: ${required_mb}MB)."
+            return 1
+        fi
+    fi
+    return 0
+}
+
+# --- Helper: ASAR root package.json version reader (Antigravity App) ---
 get_app_asar_version() {
     local asar="$1"
     [[ -f "$asar" ]] || return 1
 
-    local _ header_size _ json_size offset size
-    read -r _ header_size _ json_size < <(od -An -t u4 -N 16 "$asar" 2>/dev/null) || return 1
-    [[ -n "${header_size:-}" && -n "${json_size:-}" ]] || return 1
+    local header_line hs json_sz
+    header_line="$(od -An -t u4 -N 16 "$asar" 2>/dev/null || true)"
+    [[ -n "$header_line" ]] || return 1
+    read -r _ hs _ json_sz <<< "$header_line"
+    [[ -n "${hs:-}" && -n "${json_sz:-}" && "$json_sz" -gt 0 ]] || return 1
 
-    read -r offset size < <(
-        dd if="$asar" bs=1 skip=16 count="$json_size" status=none 2>/dev/null \
+    local pkg_info off sz
+    pkg_info="$(
+        dd if="$asar" bs=1 skip=16 count="$json_sz" status=none 2>/dev/null \
         | grep -oE '"package\.json"[[:space:]]*:[[:space:]]*\{[^}]+\}' \
         | tail -n 1 \
-        | sed -E 's/.*"size"[[:space:]]*:[[:space:]]*([0-9]+).*"offset"[[:space:]]*:[[:space:]]*"([0-9]+)".*/\2 \1/; s/.*"offset"[[:space:]]*:[[:space:]]*"([0-9]+)".*"size"[[:space:]]*:[[:space:]]*([0-9]+).*/\1 \2/'
-    )
-    [[ -n "${offset:-}" && -n "${size:-}" ]] || return 1
+        | sed -E 's/.*"size"[[:space:]]*:[[:space:]]*([0-9]+).*"offset"[[:space:]]*:[[:space:]]*"([0-9]+)".*/\2 \1/; s/.*"offset"[[:space:]]*:[[:space:]]*"([0-9]+)".*"size"[[:space:]]*:[[:space:]]*([0-9]+).*/\1 \2/' \
+        || true
+    )"
+    [[ -n "$pkg_info" ]] || return 1
+    read -r off sz <<< "$pkg_info"
+    [[ -n "${off:-}" && -n "${sz:-}" ]] || return 1
 
-    dd if="$asar" bs=1 skip=$((8 + header_size + offset)) count="$size" status=none 2>/dev/null \
+    dd if="$asar" bs=1 skip=$((8 + hs + off)) count="$sz" status=none 2>/dev/null \
         | grep -oE '"version"[[:space:]]*:[[:space:]]*"[^"]+"' \
-        | awk -F'"' 'NR==1 {print $4; exit}'
+        | awk -F'"' 'NR==1 {print $4; exit}' || true
 }
 
-# Zero-dependency ASAR PNG icon extractor (Antigravity App)
+# --- Helper: ASAR PNG icon extractor (Antigravity App) ---
 extract_app_icon() {
     local asar="$1"
     local out_png="$2"
     [[ -f "$asar" ]] || return 1
 
-    local _ header_size _ json_size size offset
-    read -r _ header_size _ json_size < <(od -An -t u4 -N 16 "$asar" 2>/dev/null) || return 1
-    [[ -n "${header_size:-}" && -n "${json_size:-}" ]] || return 1
+    local header_line hs json_sz
+    header_line="$(od -An -t u4 -N 16 "$asar" 2>/dev/null || true)"
+    [[ -n "$header_line" ]] || return 1
+    read -r _ hs _ json_sz <<< "$header_line"
+    [[ -n "${hs:-}" && -n "${json_sz:-}" && "$json_sz" -gt 0 ]] || return 1
 
-    read -r size offset < <(
-        dd if="$asar" bs=1 skip=16 count="$json_size" status=none 2>/dev/null \
+    local icon_info size offset
+    icon_info="$(
+        dd if="$asar" bs=1 skip=16 count="$json_sz" status=none 2>/dev/null \
         | grep -oE '"[^"]+\.png"[[:space:]]*:[[:space:]]*\{[^}]+\}' \
         | sed -E 's/"([^"]+\.png)"[[:space:]]*:[[:space:]]*\{[^}]*"size"[[:space:]]*:[[:space:]]*([0-9]+)[^}]*"offset"[[:space:]]*:[[:space:]]*"([0-9]+)".*/\2 \3/; s/"([^"]+\.png)"[[:space:]]*:[[:space:]]*\{[^}]*"offset"[[:space:]]*:[[:space:]]*"([0-9]+)"[^}]*"size"[[:space:]]*:[[:space:]]*([0-9]+).*/\3 \2/' \
         | sort -nr \
-        | awk 'NR==1 {print; exit}'
-    )
+        | awk 'NR==1 {print; exit}' \
+        || true
+    )"
+    [[ -n "$icon_info" ]] || return 1
+    read -r size offset <<< "$icon_info"
     [[ -n "${size:-}" && -n "${offset:-}" ]] || return 1
 
-    dd if="$asar" bs=1 skip=$((8 + header_size + offset)) count="$size" of="$out_png" status=none 2>/dev/null
+    mkdir -p "$(dirname "$out_png")"
+    dd if="$asar" bs=1 skip=$((8 + hs + offset)) count="$size" of="$out_png" status=none 2>/dev/null
     chmod 644 "$out_png"
 }
 
-# Zero-dependency product.json ideVersion reader (Antigravity IDE)
+# --- Helper: product.json ideVersion reader (Antigravity IDE) ---
 get_ide_product_version() {
     local prod="$1"
     [[ -f "$prod" ]] || return 1
 
     grep -oE '"ideVersion"[[:space:]]*:[[:space:]]*"[^"]+"' "$prod" 2>/dev/null \
-        | awk -F'"' 'NR==1 {print $4; exit}'
+        | awk -F'"' 'NR==1 {print $4; exit}' || true
 }
 
-# Ensure system-wide .desktop files and icons exist
+# --- Helper: Provision desktop files & icons ---
 ensure_desktop_entries() {
     local refreshed=0
 
+    # 1. Antigravity App desktop entry & icon
     if [[ -d "/opt/antigravity" ]]; then
         local app_icon="$SYS_ICON_DIR/antigravity.png"
         if [[ ! -s "$app_icon" ]]; then
@@ -91,7 +266,16 @@ DESKTOP
         fi
     fi
 
+    # 2. Antigravity IDE desktop entry & icon
     if [[ -d "/opt/antigravity-ide" ]]; then
+        local ide_icon="$SYS_ICON_DIR/antigravity-ide.png"
+        local source_icon="/opt/antigravity-ide/resources/app/resources/linux/code.png"
+        if [[ -f "$source_icon" && ! -s "$ide_icon" ]]; then
+            cp -f "$source_icon" "$ide_icon"
+            chmod 644 "$ide_icon"
+            refreshed=1
+        fi
+
         local ide_desktop="$SYS_APP_DIR/antigravity-ide.desktop"
         if [[ ! -f "$ide_desktop" ]]; then
             cat > "$ide_desktop" << 'DESKTOP'
@@ -100,10 +284,10 @@ Name=Antigravity IDE
 Comment=Code Editing. Redefined.
 GenericName=Text Editor
 Exec=/usr/local/bin/antigravity-ide %F
-Icon=/opt/antigravity-ide/resources/app/resources/linux/code.png
+Icon=/usr/share/icons/hicolor/256x256/apps/antigravity-ide.png
 Type=Application
 StartupNotify=false
-StartupWMClass=Antigravity IDE
+StartupWMClass=antigravity-ide
 Categories=TextEditor;Development;IDE;
 MimeType=application/x-antigravity-ide-workspace;
 Actions=new-empty-window;
@@ -112,7 +296,7 @@ Keywords=vscode;antigravity;ide;
 [Desktop Action new-empty-window]
 Name=New Empty Window
 Exec=/usr/local/bin/antigravity-ide --new-window %F
-Icon=/opt/antigravity-ide/resources/app/resources/linux/code.png
+Icon=/usr/share/icons/hicolor/256x256/apps/antigravity-ide.png
 DESKTOP
             chmod 644 "$ide_desktop"
             refreshed=1
@@ -122,20 +306,11 @@ DESKTOP
     if [[ "$refreshed" -eq 1 ]]; then
         gtk-update-icon-cache -f -t /usr/share/icons/hicolor 2>/dev/null || true
         update-desktop-database "$SYS_APP_DIR" 2>/dev/null || true
-        echo "[antigravity-hook] System desktop launchers and icons verified."
+        log "System desktop launchers and icons verified."
     fi
 }
 
-# Fetch raw HTML from the download page with retries and timeout
-PAGE=$(curl -fsSL --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 1 "https://antigravity.google/download" 2>/dev/null)
-if [[ -z "$PAGE" ]]; then
-    echo "[antigravity-hook] Offline or download page unreachable; skipping."
-    exit 0
-fi
-
-APP_URL=$(printf '%s\n' "$PAGE" | grep -oE 'https://storage\.googleapis\.com/[^"'\'' <>]+/linux-x64/Antigravity\.tar\.gz' | awk 'NR==1 {print; exit}')
-IDE_URL=$(printf '%s\n' "$PAGE" | grep -oE 'https://edgedl\.me\.gvt1\.com/[^"'\'' <>]+/linux-x64/Antigravity(%20| )IDE\.tar\.gz' | awk 'NR==1 {print; exit}')
-
+# --- Atomic Swapper with Rollback & Health Check ---
 swap_install() {
     local label="$1"
     local install_dir="$2"
@@ -143,29 +318,66 @@ swap_install() {
     local url="$4"
     local target_id="$5"
 
-    if [[ -d "$install_dir" ]] && pgrep -f "$install_dir/$bin_name" >/dev/null 2>&1; then
-        echo "[antigravity-hook] Update $target_id available for $label, but app is running. Skipping."
+    if is_app_running "$install_dir/$bin_name"; then
+        log "Update $target_id available for $label, but application is actively running. Skipping to prevent corruption."
+        return 1
+    fi
+
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        log "[DRY RUN] Would install/update $label ($target_id) from $url into $install_dir."
+        return 0
+    fi
+
+    # Check disk space on /tmp (download & extraction) and /opt (installation)
+    if ! check_disk_space "/tmp" 600 || ! check_disk_space "/opt" 600; then
+        log "Aborting $label update due to insufficient disk space."
         return 1
     fi
 
     if [[ -d "$install_dir" ]]; then
-        echo "[antigravity-hook] Updating $label to $target_id..."
+        log "Updating $label to $target_id..."
     else
-        echo "[antigravity-hook] Installing $label $target_id afresh..."
+        log "Installing $label $target_id afresh..."
     fi
 
     local tmp_dir
-    tmp_dir="$(mktemp -d)"
+    tmp_dir="$(mktemp -d -p /tmp antigravity-update.XXXXXX)"
+    CLEANUP_DIRS+=("$tmp_dir")
 
-    if ! curl -fsL --connect-timeout 15 --retry 2 "$url" -o "$tmp_dir/archive.tar.gz"; then
-        echo "[antigravity-hook] Download failed for $label; skipping."
+    local archive="$tmp_dir/archive.tar.gz"
+
+    if ! curl -fSL --connect-timeout 20 --max-time 600 --retry 3 --retry-delay 2 "$url" -o "$archive"; then
+        log "Download failed for $label ($url); skipping."
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+
+    # 1. Integrity check: file existence and minimal size (> 10MB)
+    if [[ ! -s "$archive" ]] || [[ "$(stat -c%s "$archive" 2>/dev/null || echo 0)" -lt 10485760 ]]; then
+        log "Downloaded archive for $label is empty or suspiciously small; aborting."
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+
+    # 2. Integrity check: gzip magic bytes (1f8b)
+    local magic
+    magic="$(od -An -N2 -t x1 "$archive" 2>/dev/null | tr -d ' ' || true)"
+    if [[ "$magic" != "1f8b" ]]; then
+        log "Downloaded file for $label failed gzip header verification (magic: '$magic'); aborting."
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+
+    # 3. Integrity check: test tar archive structure and checksums
+    if ! tar -tzf "$archive" >/dev/null 2>&1; then
+        log "Tar archive integrity verification failed for $label; archive is corrupt. Aborting."
         rm -rf "$tmp_dir"
         return 1
     fi
 
     mkdir -p "$tmp_dir/extracted"
-    if ! tar -xzf "$tmp_dir/archive.tar.gz" -C "$tmp_dir/extracted"; then
-        echo "[antigravity-hook] Archive extraction failed for $label; skipping."
+    if ! tar -xzf "$archive" -C "$tmp_dir/extracted"; then
+        log "Archive extraction failed for $label; aborting."
         rm -rf "$tmp_dir"
         return 1
     fi
@@ -176,70 +388,161 @@ swap_install() {
         stage_dir="${top_entries[0]}"
     fi
 
-    if [[ ! -f "$stage_dir/chrome-sandbox" ]]; then
-        echo "[antigravity-hook] Unexpected archive structure for $label; aborting."
+    # Verify expected payload structure
+    if [[ ! -f "$stage_dir/chrome-sandbox" ]] || [[ ! -f "$stage_dir/$bin_name" ]]; then
+        log "Unexpected payload structure for $label (missing chrome-sandbox or $bin_name); aborting."
         rm -rf "$tmp_dir"
         return 1
     fi
 
-    rm -rf "${install_dir}.bak"
-    [[ -d "$install_dir" ]] && mv "$install_dir" "${install_dir}.bak"
+    # Atomic swap with rollback
+    local bak_dir="${install_dir}.bak"
+    rm -rf "$bak_dir"
+    if [[ -d "$install_dir" ]]; then
+        mv "$install_dir" "$bak_dir"
+    fi
+
     mkdir -p "$install_dir"
-    cp -a "$stage_dir"/. "$install_dir"/
+    if ! cp -a "$stage_dir"/. "$install_dir"/; then
+        log "ERROR: Failed to copy extracted files for $label into $install_dir. Rolling back..."
+        rm -rf "$install_dir"
+        [[ -d "$bak_dir" ]] && mv "$bak_dir" "$install_dir"
+        rm -rf "$tmp_dir"
+        return 1
+    fi
 
     chown -R root:root "$install_dir"
     chmod 4755 "$install_dir/chrome-sandbox"
+    chmod 755 "$install_dir/$bin_name"
     ln -sfn "$install_dir/$bin_name" "/usr/local/bin/$bin_name"
-    rm -rf "${install_dir}.bak" "$tmp_dir"
+
+    # Post-install verification / health check
+    if [[ ! -x "$install_dir/$bin_name" ]] || [[ "$(stat -c "%a" "$install_dir/chrome-sandbox" 2>/dev/null || echo "")" != "4755" ]]; then
+        log "ERROR: Health check failed for $label after installation. Rolling back..."
+        rm -rf "$install_dir"
+        [[ -d "$bak_dir" ]] && mv "$bak_dir" "$install_dir"
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+
+    # Installation verified successfully; prune backup and temp files
+    rm -rf "$bak_dir" "$tmp_dir"
     return 0
 }
 
-# --- 1. Antigravity App (fresh install OR live ASAR version + build ID update) ---
+# --- 3. Fetch Upstream Download Catalog ---
+PAGE=$(curl -fsSL --connect-timeout 15 --max-time 30 --retry 2 --retry-delay 1 "https://antigravity.google/download" 2>/dev/null || true)
+if [[ -z "$PAGE" ]]; then
+    log "Download page unreachable or offline; skipping check."
+    exit 0
+fi
+
+# Scrape download URLs strictly from official Google CDN domains
+APP_URL=$(printf '%s\n' "$PAGE" | grep -oE 'https://storage\.googleapis\.com/antigravity-public/[^"'\'' <>]+/linux-x64/Antigravity\.tar\.gz' | head -n 1 || true)
+IDE_URL=$(printf '%s\n' "$PAGE" | grep -oE 'https://edgedl\.me\.gvt1\.com/edgedl/[^"'\'' <>]+/linux-x64/Antigravity(%20|%2520|\+| )IDE\.tar\.gz' | head -n 1 || true)
+
+# Normalize spaces to URL-encoded %20
+if [[ -n "$IDE_URL" ]]; then
+    IDE_URL="${IDE_URL// /%20}"
+fi
+
+# --- 4. Process Antigravity App ---
 if [[ -z "$APP_URL" ]]; then
-    echo "[antigravity-hook] Could not resolve URL for Antigravity App; skipping."
+    log "Could not resolve download URL for Antigravity App from upstream; skipping."
 else
-    REMOTE_APP_BUILD=$(printf '%s\n' "$APP_URL" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+-[0-9]+' | awk 'NR==1 {print; exit}')
-    : "${REMOTE_APP_BUILD:=$APP_URL}"
+    REMOTE_APP_BUILD=$(printf '%s\n' "$APP_URL" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+-[0-9]+' | head -n 1 || true)
     REMOTE_APP_VER="${REMOTE_APP_BUILD%%-*}"
+    : "${REMOTE_APP_VER:=unknown}"
+
     LOCAL_APP_VER=$(get_app_asar_version "/opt/antigravity/resources/app.asar" || echo "none")
     LOCAL_APP_BUILD=$(cat "$STATE_DIR/antigravity.build" 2>/dev/null || echo "")
 
-    if [[ -d "/opt/antigravity" ]] && [[ "$LOCAL_APP_VER" == "$REMOTE_APP_VER" ]] && [[ -z "$LOCAL_APP_BUILD" || "$LOCAL_APP_BUILD" == "$REMOTE_APP_BUILD" ]]; then
-        echo "$REMOTE_APP_BUILD" > "$STATE_DIR/antigravity.build"
-        echo "[antigravity-hook] Antigravity App ($LOCAL_APP_VER | build $REMOTE_APP_BUILD) is up to date."
+    needs_app_update=0
+    if [[ ! -d "/opt/antigravity" || "$FORCE_UPDATE" -eq 1 ]]; then
+        needs_app_update=1
+    elif [[ -n "$REMOTE_APP_BUILD" && "$LOCAL_APP_BUILD" != "$REMOTE_APP_BUILD" ]]; then
+        needs_app_update=1
+    elif [[ "$LOCAL_APP_VER" == "none" ]]; then
+        needs_app_update=1
     else
-        if swap_install "Antigravity App" "/opt/antigravity" "antigravity" "$APP_URL" "$REMOTE_APP_VER ($REMOTE_APP_BUILD)"; then
-            NEW_APP_VER=$(get_app_asar_version "/opt/antigravity/resources/app.asar" || echo "$REMOTE_APP_VER")
-            echo "$REMOTE_APP_BUILD" > "$STATE_DIR/antigravity.build"
-            extract_app_icon "/opt/antigravity/resources/app.asar" "$SYS_ICON_DIR/antigravity.png" || true
-            echo "[antigravity-hook] Antigravity App ready: $LOCAL_APP_VER -> $NEW_APP_VER ($REMOTE_APP_BUILD)."
+        # Semantic version check: only update if remote is newer or force is set
+        if [[ "$REMOTE_APP_VER" != "unknown" && "$LOCAL_APP_VER" != "unknown" ]]; then
+            version_compare "$LOCAL_APP_VER" "$REMOTE_APP_VER" || cmp_res=$?
+            cmp_res="${cmp_res:-0}"
+            if [[ "$cmp_res" -eq 2 ]]; then
+                needs_app_update=1
+            elif [[ "$cmp_res" -eq 1 && "$FORCE_UPDATE" -eq 0 ]]; then
+                log "Local Antigravity App ($LOCAL_APP_VER) is newer than upstream ($REMOTE_APP_VER); skipping downgrade."
+                needs_app_update=0
+            fi
+        fi
+    fi
+
+    if [[ "$needs_app_update" -eq 0 ]]; then
+        [[ "$DRY_RUN" -eq 0 && -n "$REMOTE_APP_BUILD" ]] && echo "$REMOTE_APP_BUILD" > "$STATE_DIR/antigravity.build"
+        log "Antigravity App ($LOCAL_APP_VER | build ${REMOTE_APP_BUILD:-untracked}) is up to date."
+    else
+        target_desc="${REMOTE_APP_VER}"
+        [[ -n "$REMOTE_APP_BUILD" ]] && target_desc="${REMOTE_APP_VER} (${REMOTE_APP_BUILD})"
+        if swap_install "Antigravity App" "/opt/antigravity" "antigravity" "$APP_URL" "$target_desc"; then
+            if [[ "$DRY_RUN" -eq 0 ]]; then
+                NEW_APP_VER=$(get_app_asar_version "/opt/antigravity/resources/app.asar" || echo "$REMOTE_APP_VER")
+                [[ -n "$REMOTE_APP_BUILD" ]] && echo "$REMOTE_APP_BUILD" > "$STATE_DIR/antigravity.build"
+                extract_app_icon "/opt/antigravity/resources/app.asar" "$SYS_ICON_DIR/antigravity.png" || true
+                log "Antigravity App ready: $LOCAL_APP_VER -> $NEW_APP_VER (${REMOTE_APP_BUILD:-})."
+            fi
         fi
     fi
 fi
 
-# --- 2. Antigravity IDE (fresh install OR live product.json ideVersion + build ID update) ---
+# --- 5. Process Antigravity IDE ---
 if [[ -z "$IDE_URL" ]]; then
-    echo "[antigravity-hook] Could not resolve URL for Antigravity IDE; skipping."
+    log "Could not resolve download URL for Antigravity IDE from upstream; skipping."
 else
-    REMOTE_IDE_BUILD=$(printf '%s\n' "$IDE_URL" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+-[0-9]+' | awk 'NR==1 {print; exit}')
-    : "${REMOTE_IDE_BUILD:=$IDE_URL}"
+    REMOTE_IDE_BUILD=$(printf '%s\n' "$IDE_URL" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+-[0-9]+' | head -n 1 || true)
     REMOTE_IDE_VER="${REMOTE_IDE_BUILD%%-*}"
+    : "${REMOTE_IDE_VER:=unknown}"
+
     LOCAL_IDE_VER=$(get_ide_product_version "/opt/antigravity-ide/resources/app/product.json" || echo "none")
     LOCAL_IDE_BUILD=$(cat "$STATE_DIR/antigravity-ide.build" 2>/dev/null || echo "")
 
-    if [[ -d "/opt/antigravity-ide" ]] && [[ "$LOCAL_IDE_VER" == "$REMOTE_IDE_VER" ]] && [[ -z "$LOCAL_IDE_BUILD" || "$LOCAL_IDE_BUILD" == "$REMOTE_IDE_BUILD" ]]; then
-        echo "$REMOTE_IDE_BUILD" > "$STATE_DIR/antigravity-ide.build"
-        echo "[antigravity-hook] Antigravity IDE ($LOCAL_IDE_VER | build $REMOTE_IDE_BUILD) is up to date."
+    needs_ide_update=0
+    if [[ ! -d "/opt/antigravity-ide" || "$FORCE_UPDATE" -eq 1 ]]; then
+        needs_ide_update=1
+    elif [[ -n "$REMOTE_IDE_BUILD" && "$LOCAL_IDE_BUILD" != "$REMOTE_IDE_BUILD" ]]; then
+        needs_ide_update=1
+    elif [[ "$LOCAL_IDE_VER" == "none" ]]; then
+        needs_ide_update=1
     else
-        if swap_install "Antigravity IDE" "/opt/antigravity-ide" "antigravity-ide" "$IDE_URL" "$REMOTE_IDE_VER ($REMOTE_IDE_BUILD)"; then
-            NEW_IDE_VER=$(get_ide_product_version "/opt/antigravity-ide/resources/app/product.json" || echo "$REMOTE_IDE_VER")
-            echo "$REMOTE_IDE_BUILD" > "$STATE_DIR/antigravity-ide.build"
-            echo "[antigravity-hook] Antigravity IDE ready: $LOCAL_IDE_VER -> $NEW_IDE_VER ($REMOTE_IDE_BUILD)."
+        if [[ "$REMOTE_IDE_VER" != "unknown" && "$LOCAL_IDE_VER" != "unknown" ]]; then
+            version_compare "$LOCAL_IDE_VER" "$REMOTE_IDE_VER" || cmp_res=$?
+            cmp_res="${cmp_res:-0}"
+            if [[ "$cmp_res" -eq 2 ]]; then
+                needs_ide_update=1
+            elif [[ "$cmp_res" -eq 1 && "$FORCE_UPDATE" -eq 0 ]]; then
+                log "Local Antigravity IDE ($LOCAL_IDE_VER) is newer than upstream ($REMOTE_IDE_VER); skipping downgrade."
+                needs_ide_update=0
+            fi
+        fi
+    fi
+
+    if [[ "$needs_ide_update" -eq 0 ]]; then
+        [[ "$DRY_RUN" -eq 0 && -n "$REMOTE_IDE_BUILD" ]] && echo "$REMOTE_IDE_BUILD" > "$STATE_DIR/antigravity-ide.build"
+        log "Antigravity IDE ($LOCAL_IDE_VER | build ${REMOTE_IDE_BUILD:-untracked}) is up to date."
+    else
+        target_desc="${REMOTE_IDE_VER}"
+        [[ -n "$REMOTE_IDE_BUILD" ]] && target_desc="${REMOTE_IDE_VER} (${REMOTE_IDE_BUILD})"
+        if swap_install "Antigravity IDE" "/opt/antigravity-ide" "antigravity-ide" "$IDE_URL" "$target_desc"; then
+            if [[ "$DRY_RUN" -eq 0 ]]; then
+                NEW_IDE_VER=$(get_ide_product_version "/opt/antigravity-ide/resources/app/product.json" || echo "$REMOTE_IDE_VER")
+                [[ -n "$REMOTE_IDE_BUILD" ]] && echo "$REMOTE_IDE_BUILD" > "$STATE_DIR/antigravity-ide.build"
+                log "Antigravity IDE ready: $LOCAL_IDE_VER -> $NEW_IDE_VER (${REMOTE_IDE_BUILD:-})."
+            fi
         fi
     fi
 fi
 
-# --- 3. Provision missing system-wide .desktop files and icons ---
-ensure_desktop_entries
-EOF
-chmod +x sbin/antigravity-apt-hook
+# --- 6. Provision / update system-wide .desktop entries & icons ---
+if [[ "$DRY_RUN" -eq 0 ]]; then
+    ensure_desktop_entries
+fi
